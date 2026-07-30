@@ -1,0 +1,160 @@
+Next 10 prompts to build the pronunciation feature (M5 in PRD.md).
+
+Read PRD.md §4.5b and the "Shadowing" bullet in CLAUDE.md before starting each
+prompt — the locked decisions there are non-negotiable. Feed one prompt at a
+time; do not batch. Each prompt assumes the previous one landed.
+
+---------------------------------------------------------------------------
+PROMPT 1 — Schemas + language→locale mapping (no network yet)
+---------------------------------------------------------------------------
+Add the pydantic models for the pronunciation feature in backend/app/models/.
+Word-level only (PRD §4.5b, MVP scope):
+  - PronunciationWord { text: str, accuracy_score: float, status: Literal["correct","mispronounced","omitted","inserted"] }
+  - PronunciationResult { overall_score: float, words: list[PronunciationWord] }
+Extend the /shadow/analyze response schema so it becomes
+  { prosody: ProsodyBlock, pronunciation: PronunciationResult | None }.
+Add a Language → Azure locale mapping helper (zh→zh-CN, es→es-ES, en→en-US)
+in a small pure module — no HTTP yet. Do NOT accept per-phoneme fields in the
+response schema even though Azure returns them; keeping them out prevents the
+frontend from depending on them prematurely (see CLAUDE.md "Locked decisions").
+Unit-test the locale mapping.
+
+---------------------------------------------------------------------------
+PROMPT 2 — Pronunciation cache module
+---------------------------------------------------------------------------
+Add pronunciation result caching. Key = sha256(target_cache_key +
+learner_audio_hash). Stores <hash>.json ONLY. Learner audio must never touch
+disk — hash the in-memory bytes and discard. Either extend services/cache.py
+with a second namespace or add a small parallel module; pick whichever keeps
+concerns clean. Add pytest coverage for: key stability, key differs when
+either input differs, round-trip write/read, no audio files ever appear in
+the cache directory. Refer to CLAUDE.md "Caching" locked decision.
+
+---------------------------------------------------------------------------
+PROMPT 3 — services/pronunciation.py: Azure REST client
+---------------------------------------------------------------------------
+Implement backend/app/services/pronunciation.py — pure I/O layer around Azure
+Speech Pronunciation Assessment (REST, not the SDK; use httpx.AsyncClient as
+required by CLAUDE.md). Signature roughly:
+  async def score(audio_bytes: bytes, target_text: str, language: Language,
+                  key: str, region: str) -> PronunciationResult
+Build the correct URL for the region, set the pronunciation-assessment header
+(reference text = target_text, granularity = word, no phoneme output surfaced),
+POST the audio, parse the JSON response into PronunciationResult. No language
+branching beyond building the locale string. Do not log the key. Do not
+persist the audio. On non-2xx, raise a typed error the router can turn into a
+clean 4xx/5xx. Unit test with a mocked httpx transport for each of zh/es/en
+(verify the correct locale hits the URL/header) and one malformed-response
+case.
+
+---------------------------------------------------------------------------
+PROMPT 4 — Wire /shadow/analyze orchestration
+---------------------------------------------------------------------------
+Update backend/app/routers/shadow.py so a single request returns both blocks:
+  1. Run prosody (existing code) unconditionally.
+  2. Read X-Azure-Speech-Key and X-Azure-Speech-Region headers. If either is
+     missing, return { prosody, pronunciation: null } — do NOT 4xx (see CLAUDE.md
+     "Independence" locked decision: prosody must run without Azure).
+  3. If both are present, compute learner_audio_hash from the in-memory upload,
+     check the pronunciation cache first, else call services/pronunciation.py
+     and cache the result. Return both blocks in one response.
+Never call Azure when the key is absent (CLAUDE.md security guardrail). Do
+not add a second endpoint — keep the frontend to one round-trip. Add router
+tests that mock the pronunciation service: key-present path, key-absent path
+(pronunciation is null, prosody still populated), cache-hit path (pronunciation
+service is not called on the second identical request).
+
+---------------------------------------------------------------------------
+PROMPT 5 — Backend end-to-end tests + failure surfaces
+---------------------------------------------------------------------------
+Add integration-style pytest coverage that stitches PROMPTS 1–4 together with
+all outbound HTTP mocked:
+  - Full analyze flow with Azure key present → both blocks populated, cache
+    file exists, learner audio is NOT on disk anywhere under the cache dir.
+  - Full analyze flow with Azure key absent → prosody populated, pronunciation
+    null, no Azure call attempted.
+  - Malformed Azure response → clean 5xx (no raw traceback in response body,
+    no secrets in logs).
+  - Re-analyzing the same (target, learner) pair → second call hits the cache
+    and never invokes the pronunciation service.
+Grep the test output to confirm the Azure key string never appears in any
+logged/asserted string.
+
+---------------------------------------------------------------------------
+PROMPT 6 — Frontend: types, API client, KeyEntry updates
+---------------------------------------------------------------------------
+Extend frontend/src/lib/types.ts with PronunciationWord + PronunciationResult
+matching the backend schema, and update ShadowAnalysis so pronunciation is
+`PronunciationResult | null`. Update frontend/src/lib/api.ts::analyzeShadow to
+send X-Azure-Speech-Key + X-Azure-Speech-Region when present and to parse the
+new response shape. Update lib/keys.ts to store/read Azure key and region
+alongside the existing keys (sessionStorage only, cleared on tab close — see
+CLAUDE.md). Update components/KeyEntry.tsx to add two fields (Azure key,
+Azure region) with clear labeling that they're optional unless the user wants
+pronunciation scoring. Do not touch App.tsx yet.
+
+---------------------------------------------------------------------------
+PROMPT 7 — Frontend: PronunciationPanel component (isolated)
+---------------------------------------------------------------------------
+Create frontend/src/components/PronunciationPanel.tsx. Props: { analysis:
+ShadowAnalysis }. Behavior:
+  - If analysis.pronunciation is null → render an empty-state block: "Add
+    your Azure Speech key and region on the first step to enable pronunciation
+    scoring." Do not render an error.
+  - Else → render the overall score as a big percentage with the same
+    green/amber/red bands FeedbackPanel uses (>=85 emerald, >=65 amber, else
+    red), and a grid of per-word chips colored by accuracy_score with the
+    same bands. Also badge omitted/inserted words distinctly.
+Match the visual language of FeedbackPanel (rounded-lg border, slate palette,
+tailwind). Add a small component test that renders both states.
+
+---------------------------------------------------------------------------
+PROMPT 8 — Wire PronunciationPanel into the slider in App.tsx
+---------------------------------------------------------------------------
+Insert PronunciationPanel as a NEW full-viewport step in App.tsx between the
+"playback + record" step (currently 5) and "pace match" (currently 6). Bump
+TOTAL_STEPS from 7 to 8. Reorder so the new flow is:
+  0 Keys → 1 Language → 2 Voice → 3 Speed → 4 Text →
+  5 Playback+Record → 6 Pronunciation → 7 Pace match
+handleAnalyze already gets a single response — store both prosody + pronunciation
+and advance to step 6 (Pronunciation) on success; the user then clicks Continue
+to reach step 7 (Pace match). The restart handler on the final panel resets
+step to 0 and clears both analysis blocks. Do not issue two separate requests
+(CLAUDE.md: "Do not fan out into two endpoints"). Run `npx tsc --noEmit` and
+confirm clean.
+
+---------------------------------------------------------------------------
+PROMPT 9 — Frontend tests + slider edge cases
+---------------------------------------------------------------------------
+Add tests for the wired-up flow:
+  - PronunciationPanel renders per-word chips with correct color bands for
+    boundary scores (64, 65, 84, 85).
+  - PronunciationPanel null-state renders the "add Azure key" message and no
+    chips.
+  - App slider: after a successful analyze with pronunciation present, the
+    slider is on step 6 and the pronunciation panel is visible; after a
+    successful analyze with pronunciation null, the pronunciation panel still
+    renders (in null state) and Continue still advances to pace-match.
+  - Restart resets to step 0 and clears both analysis blocks.
+
+---------------------------------------------------------------------------
+PROMPT 10 — Env docs, error surfaces, manual smoke test
+---------------------------------------------------------------------------
+Final polish:
+  - Update backend README / any .env.example to document the new headers
+    (X-Azure-Speech-Key, X-Azure-Speech-Region). Do not add server-side env
+    vars — this is BYOK.
+  - Surface a friendly UI message on the pronunciation panel if the backend
+    returns a 5xx for the pronunciation portion (rare — most failures degrade
+    to `pronunciation: null` from PROMPT 4). Prosody must remain visible in
+    that case.
+  - Write a short manual smoke-test checklist in the PR description:
+      (a) English with Azure key → both panels populated, chips colored.
+      (b) English without Azure key → pace-match still works, pronunciation
+          panel shows the null state.
+      (c) Mandarin with Azure key + OpenAI key → per-word scores reflect tone
+          accuracy where Azure supplies it.
+      (d) Repeat analyze on the same recording → second run is instant (cache
+          hit); check backend logs show no Azure request on the retry.
+      (e) Confirm no learner audio files exist under the cache directory
+          after any of the above.

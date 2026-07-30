@@ -1,0 +1,35 @@
+# Local dev stack: FastAPI backend + Vite frontend.
+# Usage:  docker compose up --build
+# Then open http://localhost:5173
+
+services:
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      # Allow the Vite dev server origin through CORS.
+      ALLOWED_ORIGINS: "http://localhost:5173"
+      CACHE_DIR: /data/cache
+    volumes:
+      # Persist the audio cache across container restarts.
+      - backend_cache:/data/cache
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      # Route /api calls from the Vite dev server to the backend service.
+      VITE_API_PROXY_TARGET: "http://backend:8000"
+    volumes:
+      # Bind-mount source for HMR; keep container's node_modules intact.
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+
+volumes:
+  backend_cache:
